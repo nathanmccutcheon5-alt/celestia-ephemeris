@@ -3,6 +3,14 @@ from flask_cors import CORS
 import swisseph as swe
 from datetime import date, datetime
 import os
+try:
+    from timezonefinder import TimezoneFinder
+    import pytz
+    _tf = TimezoneFinder()
+    TZ_AVAILABLE = True
+except ImportError:
+    TZ_AVAILABLE = False
+    _tf = None
 
 app = Flask(__name__)
 CORS(app)
@@ -100,6 +108,31 @@ EVENT_ASPECT_SCORE = {
 def date_to_jd(y, m, d, h=12.0):
     return swe.julday(y, m, d, h)
 
+def local_to_ut(year, month, day, local_hour, lat, lon):
+    """
+    Convert local birth time to Universal Time using lat/lon + date.
+    Returns UT hour float. Falls back to local_hour if timezone unavailable.
+    """
+    if not TZ_AVAILABLE or lat is None or lon is None:
+        return local_hour
+    try:
+        tz_name = _tf.timezone_at(lat=lat, lng=lon)
+        if not tz_name:
+            return local_hour
+        tz = pytz.timezone(tz_name)
+        # Create a naive local datetime and localize it (handles DST correctly)
+        local_dt = datetime(year, month, day, int(local_hour), int((local_hour % 1) * 60))
+        local_dt_aware = tz.localize(local_dt, is_dst=None)
+        # Convert to UTC
+        utc_dt = local_dt_aware.astimezone(pytz.utc)
+        ut_hour = utc_dt.hour + utc_dt.minute / 60.0
+        # Handle day boundary — if UTC date differs, adjust JD in caller
+        # For simplicity we return (ut_hour, day_offset)
+        day_offset = (utc_dt.date() - local_dt_aware.date()).days
+        return ut_hour, day_offset
+    except Exception:
+        return local_hour, 0
+
 def get_pos(jd, pid):
     return swe.calc_ut(jd, pid)[0][0]
 
@@ -169,8 +202,21 @@ def jd_to_date(jd):
     return date(y, m, int(d))
 
 def calc_natal(birth, overrides=None):
-    h = birth.get('hour', 12.0)
-    jd = date_to_jd(birth['year'], birth['month'], birth['day'], h)
+    local_h = birth.get('hour', 12.0)
+    lat = birth.get('lat')
+    lon = birth.get('lon')
+
+    # Convert local birth time to UT if we have coordinates
+    result = local_to_ut(birth['year'], birth['month'], birth['day'], local_h, lat, lon)
+    if isinstance(result, tuple):
+        h, day_offset = result
+        # Adjust date if UTC crosses midnight
+        from datetime import date as date_cls, timedelta
+        d = date_cls(birth['year'], birth['month'], birth['day']) + timedelta(days=day_offset)
+        jd = date_to_jd(d.year, d.month, d.day, h)
+    else:
+        h = result
+        jd = date_to_jd(birth['year'], birth['month'], birth['day'], h)
     natal = {}
     for name, pid in PLANETS.items():
         natal[name] = get_pos(jd, pid)
@@ -407,7 +453,7 @@ def get_life_events(natal, birth_year):
 
 @app.route('/health')
 def health():
-    return jsonify({'status': 'ok'})
+    return jsonify({'status': 'ok', 'timezone_support': TZ_AVAILABLE})
 
 @app.route('/natal', methods=['POST'])
 def natal_chart():
