@@ -75,6 +75,28 @@ ASPECTS = [
     {'name':'sextile','target':60,'orb':5},
 ]
 
+# For /events — only outer/slow planets hitting natal key points
+EVENT_TRANSIT_PLANETS = ['Pluto','Neptune','Uranus','Saturn','Jupiter']
+EVENT_NATAL_POINTS = ['Sun','Moon','Venus','Mars','Mercury','Ascendant','Midheaven','Saturn','Jupiter']
+# Only the most significant aspect types for life events
+EVENT_ASPECTS = [
+    {'name':'conjunction','target':0,'orb':5},
+    {'name':'opposition','target':180,'orb':5},
+    {'name':'square','target':90,'orb':5},
+    {'name':'trine','target':120,'orb':4},
+]
+# Score weight for ranking (transit planet x natal point)
+EVENT_SCORE = {
+    'Pluto': 10, 'Neptune': 8, 'Uranus': 8, 'Saturn': 7, 'Jupiter': 5,
+}
+EVENT_NATAL_SCORE = {
+    'Sun': 5, 'Moon': 5, 'Ascendant': 5, 'Midheaven': 4,
+    'Venus': 3, 'Mars': 3, 'Saturn': 3, 'Jupiter': 2, 'Mercury': 1,
+}
+EVENT_ASPECT_SCORE = {
+    'conjunction': 5, 'opposition': 4, 'square': 4, 'trine': 3,
+}
+
 def date_to_jd(y, m, d, h=12.0):
     return swe.julday(y, m, d, h)
 
@@ -93,6 +115,14 @@ def angle_diff(a, b):
 def check_aspect(tlon, nlon):
     diff = angle_diff(tlon, nlon)
     for asp in ASPECTS:
+        ao = abs(diff - asp['target'])
+        if ao <= asp['orb']:
+            return asp['name'], ao
+    return None, None
+
+def check_event_aspect(tlon, nlon):
+    diff = angle_diff(tlon, nlon)
+    for asp in EVENT_ASPECTS:
         ao = abs(diff - asp['target'])
         if ao <= asp['orb']:
             return asp['name'], ao
@@ -130,6 +160,14 @@ def fmt_range(s, e, p=None):
         r += f" (peak {ms[pd.month-1]} {pd.day})"
     return r
 
+def jd_to_year_float(jd):
+    y, m, d, _ = swe.revjul(jd)
+    return y + (m - 1) / 12 + (d - 1) / 365.25
+
+def jd_to_date(jd):
+    y, m, d, _ = swe.revjul(jd)
+    return date(y, m, int(d))
+
 def calc_natal(birth, overrides=None):
     h = birth.get('hour', 12.0)
     jd = date_to_jd(birth['year'], birth['month'], birth['day'], h)
@@ -137,7 +175,6 @@ def calc_natal(birth, overrides=None):
     for name, pid in PLANETS.items():
         natal[name] = get_pos(jd, pid)
 
-    # Houses if we have lat/lon and birth time
     houses_data = None
     if birth.get('lat') and birth.get('lon') and h != 12.0:
         cusps, ascmc = swe.houses(jd, birth['lat'], birth['lon'], b'P')
@@ -145,7 +182,6 @@ def calc_natal(birth, overrides=None):
         natal['Midheaven'] = ascmc[1]
         houses_data = list(cusps)
 
-    # Apply sign overrides
     if overrides:
         for point, sign in overrides.items():
             if sign and sign in SIGN_NAMES:
@@ -158,13 +194,9 @@ def calc_natal(birth, overrides=None):
     return natal, jd, houses_data
 
 def calc_natal_aspects(natal):
-    """Calculate aspects between natal planets for the wheel."""
     ASPECT_COLORS = {
-        'conjunction': '#c9a96e',
-        'trine': '#5db8a0',
-        'sextile': '#8b7fd4',
-        'square': '#c47d8e',
-        'opposition': '#d4955a',
+        'conjunction': '#c9a96e', 'trine': '#5db8a0',
+        'sextile': '#8b7fd4', 'square': '#c47d8e', 'opposition': '#d4955a',
     }
     planets = ['Sun','Moon','Mercury','Venus','Mars','Jupiter','Saturn','Uranus','Neptune','Pluto']
     aspects = []
@@ -175,12 +207,10 @@ def calc_natal_aspects(natal):
             asp_name, orb = check_aspect(natal[p1], natal[p2])
             if asp_name and asp_name in ['conjunction','trine','sextile','square','opposition']:
                 aspects.append({
-                    'p1': p1, 'p2': p2,
-                    'aspect': asp_name,
+                    'p1': p1, 'p2': p2, 'aspect': asp_name,
                     'orb': round(orb, 1),
                     'color': ASPECT_COLORS.get(asp_name, '#888'),
-                    'lon1': natal[p1],
-                    'lon2': natal[p2],
+                    'lon1': natal[p1], 'lon2': natal[p2],
                 })
     return aspects
 
@@ -222,6 +252,159 @@ def get_transits(natal, start_jd):
     results.sort(key=lambda x: (-x['intensity'], -PLANET_WEIGHT.get(x['symbol'], 0)))
     return results[:8]
 
+
+def get_life_events(natal, birth_year):
+    """
+    Scan 1990–2030 (or birth_year+5 whichever is later) for the top 15
+    most significant slow-planet transits to natal key points.
+    Uses monthly sampling for speed, then refines peak date.
+    """
+    today = date.today()
+    today_jd = date_to_jd(today.year, today.month, today.day)
+
+    scan_start_year = max(1990, birth_year + 5)
+    scan_end_year = 2031
+    start_jd = date_to_jd(scan_start_year, 1, 1)
+    end_jd = date_to_jd(scan_end_year, 1, 1)
+
+    candidates = []
+    seen = set()  # deduplicate by (transit_planet, natal_point, aspect)
+
+    for t_name in EVENT_TRANSIT_PLANETS:
+        t_id = PLANETS[t_name]
+
+        for n_name in EVENT_NATAL_POINTS:
+            if n_name not in natal:
+                continue
+            n_lon = natal[n_name]
+
+            # Sample every 14 days for speed
+            jd = start_jd
+            in_aspect = False
+            asp_start_jd = None
+            asp_peak_jd = None
+            asp_peak_orb = 999
+            current_asp = None
+
+            while jd <= end_jd:
+                t_lon = get_pos(jd, t_id)
+                asp_name, orb_val = check_event_aspect(t_lon, n_lon)
+
+                if asp_name:
+                    if not in_aspect or asp_name != current_asp:
+                        # New aspect window starting
+                        if in_aspect and current_asp:
+                            # Save previous
+                            key = (t_name, n_name, current_asp, int(asp_peak_jd / 365))
+                            if key not in seen:
+                                seen.add(key)
+                                score = (EVENT_SCORE.get(t_name, 3) +
+                                         EVENT_NATAL_SCORE.get(n_name, 1) +
+                                         EVENT_ASPECT_SCORE.get(current_asp, 2))
+                                t_sign, t_deg = lon_to_sign(get_pos(asp_peak_jd, t_id))
+                                n_sign, n_deg = lon_to_sign(n_lon)
+                                peak_date = jd_to_date(asp_peak_jd)
+                                is_past = asp_peak_jd < today_jd
+                                colors = PLANET_COLOR.get(t_name, {'bg':'rgba(180,178,169,0.15)','color':'#b4b2a9'})
+                                candidates.append({
+                                    'transitPlanet': t_name,
+                                    'natalPoint': n_name,
+                                    'aspect': current_asp,
+                                    'peakDate': peak_date.isoformat(),
+                                    'peakYear': peak_date.year,
+                                    'score': score,
+                                    'isPast': is_past,
+                                    'transitSign': t_sign,
+                                    'natalSign': n_sign,
+                                    'symbol': PLANET_SYMBOL.get(t_name, t_name[0]),
+                                    'bg': colors['bg'],
+                                    'color': colors['color'],
+                                    'name': f"{t_name} {current_asp} natal {n_name}",
+                                })
+                        in_aspect = True
+                        asp_start_jd = jd
+                        asp_peak_jd = jd
+                        asp_peak_orb = orb_val
+                        current_asp = asp_name
+                    else:
+                        if orb_val < asp_peak_orb:
+                            asp_peak_orb = orb_val
+                            asp_peak_jd = jd
+                else:
+                    if in_aspect and current_asp:
+                        key = (t_name, n_name, current_asp, int(asp_peak_jd / 365))
+                        if key not in seen:
+                            seen.add(key)
+                            score = (EVENT_SCORE.get(t_name, 3) +
+                                     EVENT_NATAL_SCORE.get(n_name, 1) +
+                                     EVENT_ASPECT_SCORE.get(current_asp, 2))
+                            t_sign, _ = lon_to_sign(get_pos(asp_peak_jd, t_id))
+                            n_sign, _ = lon_to_sign(n_lon)
+                            peak_date = jd_to_date(asp_peak_jd)
+                            is_past = asp_peak_jd < today_jd
+                            colors = PLANET_COLOR.get(t_name, {'bg':'rgba(180,178,169,0.15)','color':'#b4b2a9'})
+                            candidates.append({
+                                'transitPlanet': t_name,
+                                'natalPoint': n_name,
+                                'aspect': current_asp,
+                                'peakDate': peak_date.isoformat(),
+                                'peakYear': peak_date.year,
+                                'score': score,
+                                'isPast': is_past,
+                                'transitSign': t_sign,
+                                'natalSign': n_sign,
+                                'symbol': PLANET_SYMBOL.get(t_name, t_name[0]),
+                                'bg': colors['bg'],
+                                'color': colors['color'],
+                                'name': f"{t_name} {current_asp} natal {n_name}",
+                            })
+                    in_aspect = False
+                    current_asp = None
+                    asp_peak_orb = 999
+
+                jd += 14  # step 2 weeks
+
+    # Sort by score desc, then chronologically within ties
+    candidates.sort(key=lambda x: (-x['score'], x['peakDate']))
+
+    # Take top 15, but ensure a blend: at least 5 past and 5 future if available
+    past = [c for c in candidates if c['isPast']]
+    future = [c for c in candidates if not c['isPast']]
+
+    # Deduplicate — only one event per (transit, natal) pair to avoid repetition
+    def dedup(lst):
+        seen_pairs = set()
+        out = []
+        for item in lst:
+            pair = (item['transitPlanet'], item['natalPoint'])
+            if pair not in seen_pairs:
+                seen_pairs.add(pair)
+                out.append(item)
+        return out
+
+    past = dedup(past)
+    future = dedup(future)
+
+    # Pick top by score, balanced
+    n_past = min(len(past), 8)
+    n_future = min(len(future), 8)
+    # Guarantee at least 5 each if possible
+    if n_past < 5: n_future = min(len(future), 15 - n_past)
+    if n_future < 5: n_past = min(len(past), 15 - n_future)
+    total = n_past + n_future
+    if total < 15:
+        extra_past = min(len(past) - n_past, 15 - total)
+        extra_future = min(len(future) - n_future, 15 - total - extra_past)
+        n_past += extra_past
+        n_future += extra_future
+
+    selected = past[:n_past] + future[:n_future]
+    # Final sort chronologically
+    selected.sort(key=lambda x: x['peakDate'])
+
+    return selected
+
+
 @app.route('/health')
 def health():
     return jsonify({'status': 'ok'})
@@ -234,16 +417,13 @@ def natal_chart():
         overrides = body.get('overrides', {})
         natal, jd, houses = calc_natal(birth, overrides)
 
-        # Build natal description
         natal_desc = {}
         for k, v in natal.items():
             sign, deg = lon_to_sign(v)
             natal_desc[k] = f"{deg}° {sign}"
 
-        # Natal aspects for wheel
         aspects = calc_natal_aspects(natal)
 
-        # Current transits
         today = date.today()
         start_jd = date_to_jd(today.year, today.month, today.day)
         transits = get_transits(natal, start_jd)
@@ -258,6 +438,28 @@ def natal_chart():
         })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+
+@app.route('/events', methods=['POST'])
+def life_events():
+    """
+    Returns the top 15 most significant slow-planet transits to natal points
+    spanning 1990–2030, blending past and future events.
+    """
+    try:
+        body = request.json
+        birth = body.get('birth', {})
+        overrides = body.get('overrides', {})
+        natal, jd, houses = calc_natal(birth, overrides)
+        birth_year = birth.get('year', 1990)
+        events = get_life_events(natal, birth_year)
+        return jsonify({
+            'events': events,
+            'calculated': date.today().isoformat(),
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
