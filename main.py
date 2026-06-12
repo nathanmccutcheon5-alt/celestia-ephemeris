@@ -484,6 +484,136 @@ def life_events():
         return jsonify({'error': str(e)}), 500
 
 
+
+# ── YEAR TRANSITS (for personalized planner) ──────────────────────────
+PLANNER_PLANETS = ['Sun','Moon','Mercury','Venus','Mars','Jupiter','Saturn','Uranus','Neptune','Pluto']
+PLANNER_NATAL_POINTS = ['Sun','Moon','Mercury','Venus','Mars','Jupiter','Saturn','Ascendant','Midheaven']
+
+def get_daily_transits(natal, jd):
+    """For a given day (jd), find all transiting-planet aspects to natal points within orb."""
+    results = []
+    for t_name in PLANNER_PLANETS:
+        t_id = PLANETS[t_name]
+        t_lon = get_pos(jd, t_id)
+        for n_name in PLANNER_NATAL_POINTS:
+            if n_name not in natal:
+                continue
+            # Skip self-aspects for fast-moving personal planets vs themselves
+            if t_name == n_name:
+                continue
+            n_lon = natal[n_name]
+            asp_name, orb_val = check_aspect(t_lon, n_lon)
+            if not asp_name:
+                continue
+            t_sign, t_deg = lon_to_sign(t_lon)
+            results.append({
+                'transitPlanet': t_name,
+                'natalPoint': n_name,
+                'aspect': asp_name,
+                'orb': round(orb_val, 2),
+                'transitSign': t_sign,
+                'transitDeg': t_deg,
+                'symbol': PLANET_SYMBOL.get(t_name, t_name[0]),
+            })
+    # Sort by tightest orb first
+    results.sort(key=lambda x: x['orb'])
+    return results
+
+
+def get_moon_phase_for_day(jd):
+    """Return moon phase name and illumination % for a given day."""
+    sun_lon = get_pos(jd, swe.SUN)
+    moon_lon = get_pos(jd, swe.MOON)
+    diff = (moon_lon - sun_lon) % 360
+    pct = diff / 360.0
+
+    PHASES = [
+        ('New Moon', 0, 0.0625), ('Waxing Crescent', 0.0625, 0.1875),
+        ('First Quarter', 0.1875, 0.3125), ('Waxing Gibbous', 0.3125, 0.4375),
+        ('Full Moon', 0.4375, 0.5625), ('Waning Gibbous', 0.5625, 0.6875),
+        ('Last Quarter', 0.6875, 0.8125), ('Waning Crescent', 0.8125, 1.0),
+    ]
+    for name, lo, hi in PHASES:
+        if lo <= pct < hi or (hi == 1.0 and pct >= lo):
+            phase_name = name
+            break
+    else:
+        phase_name = 'New Moon'
+
+    moon_sign, moon_deg = lon_to_sign(moon_lon)
+    return {'phase': phase_name, 'moonSign': moon_sign, 'moonDeg': moon_deg}
+
+
+@app.route('/year-transits', methods=['POST'])
+def year_transits():
+    """
+    Returns daily transit data for an entire calendar year, for use in
+    generating a personalized astrology planner.
+
+    Body: { birth: {...}, overrides: {...}, year: 2027 }
+
+    Response: {
+      year: 2027,
+      natal: {...},        # natal placements (sign + degree)
+      days: [
+        {
+          date: "2027-01-01",
+          moonPhase: "Waning Crescent",
+          moonSign: "Sagittarius",
+          transits: [ {transitPlanet, natalPoint, aspect, orb, transitSign, ...}, ... ]
+        },
+        ... 365 entries
+      ]
+    }
+    """
+    try:
+        body = request.json
+        birth = body.get('birth', {})
+        overrides = body.get('overrides', {})
+        year = body.get('year')
+        if not year:
+            return jsonify({'error': 'year is required'}), 400
+
+        natal, jd, houses = calc_natal(birth, overrides)
+
+        natal_desc = {}
+        for k, v in natal.items():
+            sign, deg = lon_to_sign(v)
+            natal_desc[k] = f"{deg}\u00b0 {sign}"
+
+        # Iterate every day of the requested year
+        start_jd = date_to_jd(year, 1, 1)
+        is_leap = (year % 4 == 0 and year % 100 != 0) or (year % 400 == 0)
+        days_in_year = 366 if is_leap else 365
+
+        days = []
+        for i in range(days_in_year):
+            day_jd = start_jd + i
+            y, m, d, _ = swe.revjul(day_jd)
+            day_date = date(y, m, int(d))
+
+            moon_info = get_moon_phase_for_day(day_jd)
+            transits = get_daily_transits(natal, day_jd)
+
+            # Keep only the tightest 1-3 transits per day to keep payload manageable
+            top_transits = transits[:3]
+
+            days.append({
+                'date': day_date.isoformat(),
+                'moonPhase': moon_info['phase'],
+                'moonSign': moon_info['moonSign'],
+                'transits': top_transits,
+            })
+
+        return jsonify({
+            'year': year,
+            'natal': natal_desc,
+            'natalLongitudes': natal,
+            'days': days,
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
